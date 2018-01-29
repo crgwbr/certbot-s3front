@@ -3,9 +3,9 @@
 from __future__ import print_function
 
 import os
+import os.path
 import sys
 import logging
-import time
 
 import zope.interface
 
@@ -61,17 +61,28 @@ class Installer(common.Plugin):
         key = open(key_path).read()
         chain = open(chain_path).read()
 
-        suffix = "-%i" % int(time.time())
+        suffix = "-%i" % int(os.path.getmtime(cert_path))
 
-        # Upload cert to IAM
-        response = client.upload_server_certificate(
-            Path="/cloudfront/letsencrypt/",
-            ServerCertificateName=name + suffix,
-            CertificateBody=body,
-            PrivateKey=key,
-            CertificateChain=chain
+        # Check if certificate already exists
+        certificates = client.list_server_certificates(
+            PathPrefix="/cloudfront/letsencrypt/"
         )
-        cert_id = response['ServerCertificateMetadata']['ServerCertificateId']
+        cert_id = None
+        for cert in certificates['ServerCertificateMetadataList']:
+            if cert['ServerCertificateName'] == (name + suffix):
+                cert_id = cert['ServerCertificateId']
+
+        # If certificate doesn't already exists, upload cert to IAM
+        if not cert_id:
+            response = client.upload_server_certificate(
+                Path="/cloudfront/letsencrypt/",
+                ServerCertificateName=name + suffix,
+                CertificateBody=body,
+                PrivateKey=key,
+                CertificateChain=chain
+            )
+            cert_id = response['ServerCertificateMetadata']['ServerCertificateId']
+
         # Update CloudFront config to use the new one
         cf_cfg = cf_client.get_distribution_config(Id=self.conf('cf-distribution-id'))
         cf_cfg['DistributionConfig']['ViewerCertificate']['IAMCertificateId'] = cert_id
@@ -100,7 +111,7 @@ class Installer(common.Plugin):
             PathPrefix="/cloudfront/letsencrypt/"
         )
         for cert in certificates['ServerCertificateMetadataList']:
-            if (name in cert['ServerCertificateName'] and
+            if (cert['ServerCertificateName'].startswith(name) and
                     cert['ServerCertificateName'] != name + suffix):
                 try:
                     client.delete_server_certificate(
@@ -108,7 +119,6 @@ class Installer(common.Plugin):
                     )
                 except botocore.exceptions.ClientError as e:
                     logger.error(e)
-
 
     def enhance(self, domain, enhancement, options=None):  # pylint: disable=missing-docstring,no-self-use
         pass  # pragma: no cover
@@ -134,5 +144,39 @@ class Installer(common.Plugin):
     def config_test(self):  # pylint: disable=missing-docstring,no-self-use
         pass  # pragma: no cover
 
-    def restart(self):  # pylint: disable=missing-docstring,no-self-use
-        pass  # pragma: no cover
+    def _get_domain_from_certificate_name(self, cert_name):
+        """Parse ServerCertificateName from IAM.
+
+        Certificate Names usually take the form of "le-example.com" or
+        "le-example.com-1234567890". We want to extract the actual domain
+        name to ensure we're uploading and deleting the correct certificates.
+        """
+        # Remove Let's Encrypt prefix
+        cert_name = cert_name.lstrip('le-')
+
+        # Remove trailing numbers if present (as last 10 characters)
+        name_fragments = cert_name.split('-')
+        if len(name_fragments) > 1 and name_fragments[-1].isdigit():
+            name_fragments = name_fragments[:-1]
+        return '-'.join(name_fragments)
+
+    def restart(self):
+        client = boto3.client('iam')
+        certificates = client.list_server_certificates(
+            PathPrefix="/cloudfront/letsencrypt/"
+        )
+
+        for domain in self.config.domains:
+            for cert in certificates['ServerCertificateMetadataList']:
+                cert_name = cert['ServerCertificateName']
+                if domain == self._get_domain_from_certificate_name(cert_name):
+                    cert_path = os.path.join(self.config.live_dir, domain, 'cert.pem')
+                    chain_path = os.path.join(self.config.live_dir, domain, 'chain.pem')
+                    fullchain_path = os.path.join(self.config.live_dir, domain, 'fullchain.pem')
+                    key_path = os.path.join(self.config.live_dir, domain, 'privkey.pem')
+                    try:
+                        open(cert_path, 'r')
+                    except IOError as e:
+                        logger.error(e)
+                        continue
+                    self.deploy_cert(domain, cert_path, key_path, chain_path, fullchain_path)
